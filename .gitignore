@@ -1,0 +1,8 @@
+data/
+venv/
+runs/
+*.jsonl
+viewer/data.json
+__pycache__/
+*.pyc
+.DS_Store
