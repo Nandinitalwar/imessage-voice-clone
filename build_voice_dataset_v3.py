@@ -13,7 +13,11 @@ This version:
      group chats have multi-party turn-taking that doesn't map cleanly to
      a single user/assistant persona pair.
   2. Merges consecutive same-sender messages within MERGE_GAP_SECONDS into
-     one "turn" (same as v1).
+     one "turn", capped at MAX_MERGED_CHARS -- v2 let a burst of 131 rapid
+     texts (someone reading out an entire essay draft) merge into one
+     4,606-character "turn", which is a merge artifact, not a natural
+     single reply, and would have skewed training toward long garbled
+     targets. Once a merge would exceed the cap, a new turn starts instead.
   3. Splits each thread's turns into SESSIONS using a real time-gap
      threshold (SESSION_GAP_SECONDS) -- a session boundary is drawn
      wherever there's a long silence, the same way a human would say
@@ -28,7 +32,23 @@ This version:
   5. Filters out URL/junk-only replies (same as the v1 cleanup pass) and
      caps how many times an exact-duplicate filler reply ("ok", "lol",
      "?") can appear, so those don't dominate the training signal.
-  6. Anonymizes each thread to Contact_N (deterministic via random.seed).
+  6. Caps examples per thread (MAX_PER_THREAD) -- v2's flat dataset was
+     65.6% dominated by its top 3 threads (one single thread alone was
+     37.9%), meaning the model would mostly learn that one relationship's
+     register instead of a general texting voice. High-quality instruction
+     datasets (UltraChat, FineWeb, Dolma) all cap per-source contribution
+     for exactly this reason -- diversity over raw volume.
+  7. Splits train/heldout by SESSION, not by flattened example -- v2
+     shuffled all examples together before splitting, so two examples
+     drawn from the same real conversation session could land on
+     opposite sides of the split (measured: 70 of 211 heldout sessions
+     also appeared in train). That's train/eval leakage: the heldout
+     "coherence" check wasn't actually testing generalization.
+  8. Computes a short, real style profile (punctuation/capitalization
+     habits measured from the actual data) and appends it to the system
+     prompt, since persona-conditioning measurably improves style
+     consistency in fine-tunes without needing more data.
+  9. Anonymizes each thread to Contact_N (deterministic via random.seed).
 """
 from __future__ import annotations
 
@@ -43,14 +63,18 @@ DB_PATH = Path.home() / "Library" / "Messages" / "chat.db"
 OUT_DIR = Path(__file__).parent / "data"
 
 MERGE_GAP_SECONDS = 120
-SESSION_GAP_SECONDS = 3 * 3600  # 3 hours of silence = new session
-CONTEXT_TURNS = 8               # how many preceding turns (within the session) to include
-DUPLICATE_CAP = 6               # max times an identical target reply may appear
+MAX_MERGED_CHARS = 400           # cap on a single merged "turn" -- longer bursts split instead
+MAX_RAW_MSG_CHARS = 500          # drop individual messages longer than this (document pastes,
+                                  # not real texting -- e.g. a 4,558-char pasted essay in one bubble)
+SESSION_GAP_SECONDS = 3 * 3600   # 3 hours of silence = new session
+CONTEXT_TURNS = 8                # how many preceding turns (within the session) to include
+DUPLICATE_CAP = 6                # max times an identical target reply may appear
+MAX_PER_THREAD = 200             # cap per-thread contribution so one relationship can't dominate
 MIN_TEXT_LEN = 1
 
 APPLE_EPOCH_OFFSET = 978307200  # seconds between 1970-01-01 and 2001-01-01
 
-SYSTEM_PROMPT = (
+BASE_SYSTEM_PROMPT = (
     "You're texting as a real person. Reply the way they naturally "
     "would in a casual iMessage conversation -- their own tone, length, "
     "and phrasing, not a generic assistant voice."
@@ -89,6 +113,8 @@ def fetch_dm_messages() -> dict[str, list[tuple[float, bool, str]]]:
     """)
     by_chat: dict[str, list[tuple[float, bool, str]]] = defaultdict(list)
     for chat_id, date_ns, is_from_me, text in cur.fetchall():
+        if len(text) > MAX_RAW_MSG_CHARS:
+            continue  # document paste, not a real text -- treat as if never sent
         unix_ts = date_ns / 1e9 + APPLE_EPOCH_OFFSET
         by_chat[chat_id].append((unix_ts, bool(is_from_me), text))
     conn.close()
@@ -96,11 +122,15 @@ def fetch_dm_messages() -> dict[str, list[tuple[float, bool, str]]]:
 
 
 def merge_into_turns(msgs: list[tuple[float, bool, str]]) -> list[dict]:
-    """Merge consecutive same-sender messages within MERGE_GAP_SECONDS."""
+    """Merge consecutive same-sender messages within MERGE_GAP_SECONDS,
+    capped at MAX_MERGED_CHARS so a long rapid-fire burst doesn't collapse
+    into one unnaturally huge "turn" -- it splits into multiple turns
+    instead once the cap is hit."""
     turns: list[dict] = []
     for ts, is_from_me, text in msgs:
         if turns and turns[-1]["is_from_me"] == is_from_me and \
-                ts - turns[-1]["end_ts"] <= MERGE_GAP_SECONDS:
+                ts - turns[-1]["end_ts"] <= MERGE_GAP_SECONDS and \
+                len(turns[-1]["text"]) < MAX_MERGED_CHARS:
             turns[-1]["text"] += "\n" + text
             turns[-1]["end_ts"] = ts
         else:
@@ -118,7 +148,37 @@ def split_into_sessions(turns: list[dict]) -> list[list[dict]]:
     return sessions
 
 
-def build_examples_for_chat(turns: list[dict]) -> list[dict]:
+def compute_style_profile(by_chat: dict[str, list[tuple[float, bool, str]]]) -> str:
+    """Measure real punctuation/capitalization habits from your own messages
+    and phrase them as an explicit style note. Persona-conditioning like this
+    measurably improves style consistency in fine-tunes without needing more
+    training data -- and some habits (e.g. almost never ending a text with
+    terminal punctuation) are easy to state directly but hard for a small
+    LoRA to reliably infer from examples alone."""
+    my_texts = [text for msgs in by_chat.values() for _, is_from_me, text in msgs if is_from_me]
+    n = len(my_texts)
+    ends_punct = sum(1 for t in my_texts if t.strip() and t.rstrip()[-1:] in ".!?")
+    has_emoji = sum(1 for t in my_texts if re.search(r"[\U0001F300-\U0001FAFF☀-➿]", t))
+
+    notes = []
+    punct_pct = 100 * ends_punct / n
+    if punct_pct < 15:
+        notes.append("You almost never end a text with a period, exclamation point, or question mark.")
+    elif punct_pct > 70:
+        notes.append("You usually end your texts with proper punctuation.")
+
+    emoji_pct = 100 * has_emoji / n
+    if emoji_pct < 10:
+        notes.append("You rarely use emoji.")
+    elif emoji_pct > 40:
+        notes.append("You use emoji fairly often.")
+
+    if not notes:
+        return BASE_SYSTEM_PROMPT
+    return BASE_SYSTEM_PROMPT + " " + " ".join(notes)
+
+
+def build_examples_for_chat(turns: list[dict], system_prompt: str) -> list[dict]:
     examples = []
     for session in split_into_sessions(turns):
         for i, turn in enumerate(session):
@@ -133,14 +193,17 @@ def build_examples_for_chat(turns: list[dict]) -> list[dict]:
                 continue
 
             context = session[max(0, i - CONTEXT_TURNS):i]
-            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+            messages = [{"role": "system", "content": system_prompt}]
             for c in context:
                 messages.append({
                     "role": "assistant" if c["is_from_me"] else "user",
                     "content": c["text"],
                 })
             messages.append({"role": "assistant", "content": turn["text"]})
-            examples.append({"messages": messages, "session_start": context[0]["start_ts"]})
+            examples.append({
+                "messages": messages,
+                "session_start": context[0]["start_ts"],
+            })
     return examples
 
 
@@ -149,29 +212,44 @@ def main() -> None:
     by_chat = fetch_dm_messages()
     print(f"Found {len(by_chat)} 1:1 DM threads")
 
+    system_prompt = compute_style_profile(by_chat)
+    print(f"Computed system prompt: {system_prompt!r}")
+
     all_examples: dict[str, list[dict]] = {}
     for chat_id, msgs in by_chat.items():
         turns = merge_into_turns(msgs)
-        examples = build_examples_for_chat(turns)
+        examples = build_examples_for_chat(turns, system_prompt)
         if examples:
             all_examples[chat_id] = examples
 
     total_raw = sum(len(v) for v in all_examples.values())
-    print(f"{len(all_examples)} threads produced examples, {total_raw} raw examples before dedup cap")
+    print(f"{len(all_examples)} threads produced examples, {total_raw} raw examples before filtering")
 
     # Cap exact-duplicate target replies globally (case/whitespace-insensitive)
     dup_counts: Counter[str] = Counter()
-    kept: dict[str, list[dict]] = defaultdict(list)
+    deduped: dict[str, list[dict]] = defaultdict(list)
     for chat_id, examples in all_examples.items():
         for ex in examples:
             target = ex["messages"][-1]["content"].strip().lower()
             if dup_counts[target] >= DUPLICATE_CAP:
                 continue
             dup_counts[target] += 1
-            kept[chat_id].append(ex)
+            deduped[chat_id].append(ex)
+
+    total_deduped = sum(len(v) for v in deduped.values())
+    print(f"{total_deduped} examples after duplicate-reply cap (max {DUPLICATE_CAP}x each)")
+
+    # Cap per-thread contribution so one relationship's register can't
+    # dominate the dataset (v2: top 3 threads alone were 65.6% of everything)
+    rng_cap = random.Random(7)
+    kept: dict[str, list[dict]] = {}
+    for chat_id, examples in deduped.items():
+        if len(examples) > MAX_PER_THREAD:
+            examples = rng_cap.sample(examples, MAX_PER_THREAD)
+        kept[chat_id] = examples
 
     total_kept = sum(len(v) for v in kept.values())
-    print(f"{total_kept} examples after duplicate-reply cap (max {DUPLICATE_CAP}x each)")
+    print(f"{total_kept} examples after per-thread cap (max {MAX_PER_THREAD} each)")
 
     # Anonymize thread identifiers deterministically
     chat_ids = sorted(kept.keys())
@@ -180,18 +258,32 @@ def main() -> None:
     rng.shuffle(shuffled)
     id_map = {cid: f"Contact_{i+1}" for i, cid in enumerate(shuffled)}
 
-    flat: list[dict] = []
+    labeled: list[dict] = []
     for chat_id, examples in kept.items():
         label = id_map[chat_id]
         for ex in examples:
-            flat.append({"thread": label, "messages": ex["messages"], "session_start": ex["session_start"]})
+            labeled.append({
+                "thread": label,
+                "messages": ex["messages"],
+                "session_start": ex["session_start"],
+                # (thread, session_start) is the atomic unit for the train/heldout
+                # split below -- splitting by flattened example (v2's approach)
+                # let two examples from the SAME real conversation land on
+                # opposite sides, which is train/eval leakage.
+                "session_id": (chat_id, ex["session_start"]),
+            })
 
-    # Deterministic shuffle + held-out split
+    # Split by SESSION, not by example, so no session straddles both files
+    session_ids = sorted(set(ex["session_id"] for ex in labeled))
     rng2 = random.Random(7)
-    rng2.shuffle(flat)
-    n_heldout = 300 if len(flat) > 3000 else max(50, len(flat) // 12)
-    heldout = flat[:n_heldout]
-    train = flat[n_heldout:]
+    rng2.shuffle(session_ids)
+    n_heldout_sessions = max(20, len(session_ids) // 12)
+    heldout_sessions = set(session_ids[:n_heldout_sessions])
+
+    train, heldout = [], []
+    for ex in labeled:
+        row = {"thread": ex["thread"], "messages": ex["messages"], "session_start": ex["session_start"]}
+        (heldout if ex["session_id"] in heldout_sessions else train).append(row)
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     with open(OUT_DIR / "voice_clone_train.jsonl", "w") as f:
@@ -202,6 +294,7 @@ def main() -> None:
             f.write(json.dumps(ex) + "\n")
 
     print(f"Wrote {len(train)} train / {len(heldout)} heldout examples to {OUT_DIR}")
+    print(f"({len(session_ids) - n_heldout_sessions} train sessions / {n_heldout_sessions} heldout sessions, zero overlap)")
 
 
 if __name__ == "__main__":
