@@ -29,9 +29,13 @@ This version:
      before your reply is genuinely from the other person (a real
      question/message you're responding to), not a delayed continuation
      of your own earlier turn.
-  5. Filters out URL/junk-only replies (same as the v1 cleanup pass) and
-     caps how many times an exact-duplicate filler reply ("ok", "lol",
-     "?") can appear, so those don't dominate the training signal.
+  5. Filters out examples where a URL, junk placeholder char, or CS
+     coursework marker appears ANYWHERE in the window -- your reply OR any
+     of the other person's messages used as context. v3 only screened your
+     own reply, so a shared link or pasted code in their message still
+     slipped into ~20% of examples as noisy context. Caps how many times
+     an exact-duplicate filler reply ("ok", "lol", "?") can appear, so
+     those don't dominate the training signal.
   6. Caps examples per thread (MAX_PER_THREAD) -- v2's flat dataset was
      65.6% dominated by its top 3 threads (one single thread alone was
      37.9%), meaning the model would mostly learn that one relationship's
@@ -193,6 +197,14 @@ def build_examples_for_chat(turns: list[dict], system_prompt: str) -> list[dict]
                 continue
 
             context = session[max(0, i - CONTEXT_TURNS):i]
+            # v3 only screened the target reply for URLs/junk/CS-boilerplate --
+            # the other person's messages used as CONTEXT went unchecked, so a
+            # shared link or pasted code in their turn still made it into the
+            # example even though your reply was clean. Screen the whole
+            # window now: skip the example if noise shows up anywhere in it.
+            if any(is_junk_or_url(c["text"]) for c in context):
+                continue
+
             messages = [{"role": "system", "content": system_prompt}]
             for c in context:
                 messages.append({

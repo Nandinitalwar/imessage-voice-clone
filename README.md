@@ -6,14 +6,15 @@ other project.
 
 ## Pipeline
 
-1. `build_voice_dataset_v3.py` -- reads `~/Library/Messages/chat.db`
+1. `build_voice_dataset_v4.py` -- reads `~/Library/Messages/chat.db`
    directly, groups messages into real conversation sessions (time-gap
    based), and produces SFT training pairs where each example's context is
    the actual chronological history that preceded your reply -- not an
    arbitrary slice of the full thread. Anonymizes the other party in each
    thread to `Contact_N`. Filters out URL/junk/coursework-boilerplate
-   replies and document-length pastes, caps duplicate filler replies (e.g.
-   "ok", "lol") and per-thread contribution so one relationship can't
+   content and document-length pastes *anywhere in the example* (your
+   reply or their messages used as context), caps duplicate filler replies
+   (e.g. "ok", "lol") and per-thread contribution so one relationship can't
    dominate, splits train/heldout by session (no leakage), and appends a
    short measured style profile (punctuation/emoji habits) to the system
    prompt.
@@ -65,3 +66,9 @@ weights are just large and reproducible from the scripts above.
   pasted documents (a college essay, source code, a work task) reaching
   6,000+ characters in one bubble, which isn't representative texting
   voice. Filtered out at the source (messages over `MAX_RAW_MSG_CHARS`).
+- **Noise leaking in through context** -- the URL/junk/CS-boilerplate
+  filter only ever screened your own reply (the training target); the
+  other person's messages used as context went unchecked, so a shared
+  link or pasted code in their turn still ended up in ~20% of examples.
+  `build_voice_dataset_v4.py` screens every message in the window, not
+  just the target.
