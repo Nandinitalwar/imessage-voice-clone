@@ -32,9 +32,34 @@ other project.
 `train_local.py`, `test_local.py`, `chat.py`, `server_qwen_local.py` are
 an earlier CPU-only pass using Qwen2.5-0.5B, kept for reference.
 
+## Inkling through OpenRouter (inference only)
+
+`server_inkling.py` runs the same style of local chat UI using the hosted
+`thinkingmachines/inkling` model through OpenRouter. This is useful for trying
+Inkling without the GPU footprint of its open weights, but it is **not a
+fine-tune** and does not load the Mistral LoRA adapter. The server never reads
+or uploads the local iMessage dataset; it sends only the messages typed into
+the live UI.
+
+The integration enables OpenRouter Zero Data Retention and denies provider data
+collection on every request. It intentionally rejects the `:free` Inkling
+endpoint because that endpoint is limited to agentic harnesses and its terms
+are not appropriate for private message content.
+
+```bash
+uv venv .venv --python 3.11
+uv pip install --python .venv/bin/python -r requirements-openrouter.txt
+export OPENROUTER_API_KEY="sk-or-v1-..."
+.venv/bin/python server_inkling.py
+```
+
+Then open `http://127.0.0.1:5058`. To change the prompt without editing code,
+set `VOICE_SYSTEM_PROMPT` before starting the server. To change the model, set
+`OPENROUTER_MODEL`; the default is the paid `thinkingmachines/inkling` route.
+
 ## Not included
 
-`data/`, `venv/`, `runs/` (trained adapter weights), and any `.jsonl` files
+`data/`, `venv/`, `.venv/`, `runs/` (trained adapter weights), and any `.jsonl` files
 are gitignored. The dataset contains real (if anonymized) personal text
 message content and shouldn't live in version control; the venv and model
 weights are just large and reproducible from the scripts above.

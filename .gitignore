@@ -1,8 +1,10 @@
 data/
 venv/
+.venv/
 runs/
 *.jsonl
 viewer/data.json
+.env
 __pycache__/
 *.pyc
 .DS_Store
